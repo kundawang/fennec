@@ -2,6 +2,7 @@ package fennec
 
 import (
 	"bytes"
+	"context"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -10,15 +11,30 @@ import (
 )
 
 // compressJPEGOptimal uses binary search to find the lowest JPEG quality
-// that still meets the target SSIM. Returns the quality, SSIM, cached encoded
-// bytes (from the winning iteration), and any error.
+// that still meets the target SSIM. Returns the quality, SSIM, measured
+// region results, cached encoded bytes (from the winning iteration), and any
+// error.
 //
 // Traditional approach: pick a quality number and hope for the best.
 // Fennec approach: measure actual perceptual quality and optimize precisely.
 //
-// The fourth return value is the cached JPEG bytes from the binary search.
-// This avoids the double-encode bug where the final output would be re-encoded.
-func compressJPEGOptimal(src *image.NRGBA, w io.Writer, targetSSIM float64, opts Options) (int, float64, []byte, error) {
+// When gate is non-nil it enforces the full-image target together with any
+// region thresholds; a quality is accepted only when every constraint passes.
+//
+// The cached JPEG bytes avoid the double-encode bug where the final output
+// would be re-encoded.
+func compressJPEGOptimal(
+	ctx context.Context,
+	src *image.NRGBA,
+	w io.Writer,
+	targetSSIM float64,
+	gate *qualityGate,
+	opts Options,
+) (int, float64, []RegionResult, []byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// Guard: if target is 1.0 (Lossless) and format is JPEG, clamp to 0.999
 	// since JPEG is inherently lossy and SSIM=1.0 is unreachable.
 	if targetSSIM >= 1.0 {
@@ -29,6 +45,7 @@ func compressJPEGOptimal(src *image.NRGBA, w io.Writer, targetSSIM float64, opts
 	lo, hi := 1, 100
 	bestQuality := hi
 	bestSSIM := 1.0
+	var bestRegions []RegionResult
 	var bestData []byte
 
 	// Fast path: if target is very high, start from higher quality.
@@ -43,28 +60,32 @@ func compressJPEGOptimal(src *image.NRGBA, w io.Writer, targetSSIM float64, opts
 	}
 
 	for lo <= hi {
+		if err := ctx.Err(); err != nil {
+			return 0, 0, nil, nil, err
+		}
 		mid := (lo + hi) / 2
 
 		// Encode at this quality.
 		var buf bytes.Buffer
 		if err := encodeJPEG(&buf, src, mid, opts.Subsample); err != nil {
-			return 0, 0, nil, err
+			return 0, 0, nil, nil, err
 		}
 
 		// Decode back to measure actual quality.
 		decoded, err := jpeg.Decode(bytes.NewReader(buf.Bytes()))
 		if err != nil {
-			return 0, 0, nil, err
+			return 0, 0, nil, nil, err
 		}
 		decodedNRGBA := toNRGBARef(decoded)
 
-		// Compute SSIM between original and compressed.
-		ssim := SSIMFast(src, decodedNRGBA)
+		// Compute SSIM between original and compressed, plus region quality.
+		ssim, regions, ok := evaluateCandidate(gate, src, targetSSIM, decodedNRGBA)
 
-		if ssim >= targetSSIM {
+		if ok {
 			// Quality is sufficient — cache this result and try lower quality.
 			bestQuality = mid
 			bestSSIM = ssim
+			bestRegions = regions
 			bestData = copyBytes(buf.Bytes())
 			hi = mid - 1
 		} else {
@@ -76,14 +97,60 @@ func compressJPEGOptimal(src *image.NRGBA, w io.Writer, targetSSIM float64, opts
 	// Write the cached best result directly instead of re-encoding.
 	if bestData != nil {
 		_, err := w.Write(bestData)
-		return bestQuality, bestSSIM, bestData, err
+		return bestQuality, bestSSIM, bestRegions, bestData, err
 	}
 
-	// Fallback: encode at best quality found.
-	if err := encodeJPEG(w, src, bestQuality, opts.Subsample); err != nil {
-		return 0, 0, nil, err
+	// No quality met every constraint. With region constraints this is an
+	// explicit failure rather than silently writing a below-threshold image.
+	if gate != nil && gate.rs != nil && gate.rs.len() > 0 {
+		// Verify at maximum quality so the error can report the best achieved.
+		if err := ctx.Err(); err != nil {
+			return 0, 0, nil, nil, err
+		}
+		var buf bytes.Buffer
+		if err := encodeJPEG(&buf, src, 100, opts.Subsample); err != nil {
+			return 0, 0, nil, nil, err
+		}
+		if decoded, derr := jpeg.Decode(bytes.NewReader(buf.Bytes())); derr == nil {
+			ssim, regions, _ := evaluateCandidate(gate, src, targetSSIM, toNRGBARef(decoded))
+			if regionsMeet(regions) {
+				// Only the whole-image target is out of reach; regions are
+				// satisfied, so fall back to the best encode (preserving the
+				// historical behaviour for unreachable global targets).
+				if _, werr := w.Write(buf.Bytes()); werr != nil {
+					return 0, 0, nil, nil, werr
+				}
+				return 100, ssim, regions, copyBytes(buf.Bytes()), nil
+			}
+			return 100, ssim, regions, nil, &QualityError{
+				Target:      targetSSIM,
+				Achieved:    ssim,
+				JPEGQuality: 100,
+				Regions:     regions,
+			}
+		}
+		return 100, 0, nil, nil, &QualityError{Target: targetSSIM, JPEGQuality: 100}
 	}
-	return bestQuality, bestSSIM, nil, nil
+
+	// Fallback: encode at best quality found. This preserves the historical
+	// behaviour for global-only SSIM targets that cannot be reached.
+	if err := ctx.Err(); err != nil {
+		return 0, 0, nil, nil, err
+	}
+	if err := encodeJPEG(w, src, bestQuality, opts.Subsample); err != nil {
+		return 0, 0, nil, nil, err
+	}
+	return bestQuality, bestSSIM, bestRegions, nil, nil
+}
+
+// evaluateCandidate measures a candidate against the gate when present, or
+// against the plain global target otherwise.
+func evaluateCandidate(gate *qualityGate, ref *image.NRGBA, targetSSIM float64, candidate *image.NRGBA) (float64, []RegionResult, bool) {
+	if gate != nil {
+		return gate.evaluate(candidate)
+	}
+	ssim := SSIMFast(ref, candidate)
+	return ssim, nil, targetSSIM <= 0 || ssim >= targetSSIM
 }
 
 // compressPNG applies PNG-specific optimizations.

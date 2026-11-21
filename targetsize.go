@@ -21,9 +21,164 @@ type sizeResult struct {
 	finalW  int
 	finalH  int
 	img     *image.NRGBA
+	regions []RegionResult
 }
 
-func hitTargetSize(ctx context.Context, original *image.NRGBA, targetBytes int, opts Options) (*sizeResult, error) {
+// targetSizeWholeImageSSIM returns the explicit whole-image SSIM target for
+// target-size mode. Only TargetSSIM is honored here: the Quality preset is a
+// quality-mode setting that target-size mode has never applied. JPEG cannot
+// reach SSIM 1.0, so the practical ceiling matches the standard JPEG search.
+func targetSizeWholeImageSSIM(opts Options) float64 {
+	if opts.TargetSSIM <= 0 || opts.TargetSSIM > 1.0 {
+		return 0
+	}
+	if opts.TargetSSIM >= 1.0 {
+		return 0.999
+	}
+	return opts.TargetSSIM
+}
+
+func hitTargetSize(ctx context.Context, original *image.NRGBA, targetBytes int, rs *regionSet, opts Options) (*sizeResult, error) {
+	candidates, err := collectSizeCandidates(ctx, original, targetBytes, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cancellation always wins over a partially-completed search.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Without region constraints the historical selection is preserved
+	// exactly: no extra quality gate is applied in target-size mode.
+	if rs == nil || rs.len() == 0 {
+		return selectSizeCandidate(candidates, targetBytes, opts), nil
+	}
+
+	// With regions configured, region thresholds always apply. An explicitly
+	// requested whole-image TargetSSIM (if any) is enforced alongside them.
+	gate := newQualityGate(ctx, rs, targetSizeWholeImageSSIM(opts), original)
+
+	var passing []*sizeResult
+	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if candidateMeetsGate(gate, c) {
+			passing = append(passing, c)
+		}
+	}
+
+	if len(passing) > 0 {
+		return selectSizeCandidate(passing, targetBytes, opts), nil
+	}
+
+	// No candidate satisfies size and quality together. Distinguish a
+	// region threshold that cannot be met even at maximum quality from a
+	// genuine size/quality conflict by probing the highest-quality encodes.
+	best, probeErr := probeMaxQuality(ctx, original, opts, gate)
+	if probeErr != nil {
+		return nil, probeErr
+	}
+	regionsOK := regionsMeet(best.regions)
+
+	qerr := &QualityError{
+		Target:      gate.targetSSIM,
+		Achieved:    best.ssim,
+		JPEGQuality: best.quality,
+		Regions:     best.regions,
+		TargetSize:  targetBytes,
+	}
+	if !regionsOK {
+		qerr.Reason = fmt.Sprintf("region quality cannot be met within %d bytes (best effort is %d bytes)",
+			targetBytes, len(best.data))
+	} else if gate.targetSSIM > 0 && best.ssim < gate.targetSSIM {
+		qerr.Reason = fmt.Sprintf("whole-image SSIM %.4f is below its %.4f target within %d bytes "+
+			"(best effort is %d bytes)", best.ssim, gate.targetSSIM, targetBytes, len(best.data))
+	} else {
+		qerr.Reason = fmt.Sprintf("target size %d bytes cannot be met together with the quality constraints "+
+			"(best effort is %d bytes)", targetBytes, len(best.data))
+	}
+	return nil, qerr
+}
+
+// probeMaxQuality encodes at the highest available quality for the formats the
+// options allow, measures each, and returns the attempt that best satisfies the
+// quality constraints. It is used only to explain a conflict in an error.
+func probeMaxQuality(ctx context.Context, original *image.NRGBA, opts Options, gate *qualityGate) (*sizeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	w, h := original.Bounds().Dx(), original.Bounds().Dy()
+
+	tryJPEG := opts.Format != PNG && isOpaque(original)
+	tryPNG := opts.Format != JPEG
+
+	var best *sizeResult
+	consider := func(r *sizeResult) {
+		if r == nil || r.img == nil {
+			return
+		}
+		if gate != nil {
+			r.ssim, r.regions, _ = gate.evaluate(r.img)
+		}
+		if best == nil {
+			best = r
+			return
+		}
+		bestScore := regionScore(best)
+		score := regionScore(r)
+		if score > bestScore || (score == bestScore && r.ssim > best.ssim) {
+			best = r
+		}
+	}
+
+	if tryJPEG {
+		var buf bytes.Buffer
+		if err := encodeJPEG(&buf, original, 100, false); err != nil {
+			return nil, err
+		}
+		img := decodeJPEGFromBytes(buf.Bytes())
+		if img == nil {
+			img = original
+		}
+		consider(&sizeResult{
+			data: copyBytes(buf.Bytes()), format: JPEG, quality: 100,
+			ssim: computeSSIMNRGBA(original, img), finalW: w, finalH: h, img: img,
+		})
+	}
+	if tryPNG {
+		var buf bytes.Buffer
+		if err := compressPNG(original, &buf, opts); err != nil {
+			return nil, err
+		}
+		consider(&sizeResult{
+			data: copyBytes(buf.Bytes()), format: PNG, quality: 0,
+			ssim: 1.0, finalW: w, finalH: h, img: original,
+		})
+	}
+
+	if best == nil {
+		return nil, fmt.Errorf("fennec: no encoder available for format %s", opts.Format)
+	}
+	return best, nil
+}
+
+// regionScore counts satisfied region thresholds; used only to rank
+// diagnostics when constraints conflict.
+func regionScore(r *sizeResult) int {
+	score := 0
+	for _, rr := range r.regions {
+		if rr.Transparent || rr.MinSSIM <= 0 || rr.Meets {
+			score++
+		}
+	}
+	return score
+}
+
+// collectSizeCandidates runs every applicable strategy and returns all
+// candidate encodings.
+func collectSizeCandidates(ctx context.Context, original *image.NRGBA, targetBytes int, opts Options) ([]*sizeResult, error) {
 	wantPNG := opts.Format == PNG
 	wantJPEG := opts.Format == JPEG
 	canUseJPEG := !wantPNG && isOpaque(original)
@@ -31,13 +186,13 @@ func hitTargetSize(ctx context.Context, original *image.NRGBA, targetBytes int, 
 	var candidates []*sizeResult
 
 	if (canUseJPEG || wantJPEG) && ctx.Err() == nil {
-		if r, err := jpegQualitySearch(original, targetBytes); err == nil && r != nil && r.quality >= minJPEGQuality {
+		if r, err := jpegQualitySearch(ctx, original, targetBytes); err == nil && r != nil && r.quality >= minJPEGQuality {
 			candidates = append(candidates, r)
 		}
 	}
 
 	if !wantJPEG && ctx.Err() == nil {
-		if r, err := quantizeStrategy(original, targetBytes); err == nil && r != nil {
+		if r, err := quantizeStrategy(ctx, original, targetBytes); err == nil && r != nil {
 			candidates = append(candidates, r)
 		}
 	}
@@ -62,16 +217,49 @@ func hitTargetSize(ctx context.Context, original *image.NRGBA, targetBytes int, 
 	}
 
 	if len(candidates) == 0 {
-		return fallbackTargetSizeEncode(original, targetBytes, canUseJPEG || wantJPEG, opts)
+		r, err := fallbackTargetSizeEncode(original, targetBytes, canUseJPEG || wantJPEG, opts)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, r)
 	}
+	return candidates, nil
+}
 
+// selectSizeCandidate picks the best candidate for the size target.
+func selectSizeCandidate(candidates []*sizeResult, targetBytes int, opts Options) *sizeResult {
 	var best *sizeResult
 	for _, c := range candidates {
 		if best == nil || betterFit(c, best, targetBytes) {
 			best = c
 		}
 	}
-	return best, nil
+	return best
+}
+
+// candidateMeetsGate decodes an encoded candidate and measures it against the
+// original through the quality gate. It records the measured SSIM and region
+// results on the candidate.
+func candidateMeetsGate(gate *qualityGate, c *sizeResult) bool {
+	if gate == nil {
+		return true
+	}
+	decoded := decodeImageFromBytes(c.data)
+	if decoded == nil {
+		return false
+	}
+	ssim, regions, ok := gate.evaluate(decoded)
+	c.ssim = ssim
+	c.regions = regions
+	return ok
+}
+
+func decodeImageFromBytes(data []byte) *image.NRGBA {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil
+	}
+	return toNRGBARef(img)
 }
 
 func fallbackTargetSizeEncode(original *image.NRGBA, target int, useJPEG bool, opts Options) (*sizeResult, error) {
@@ -114,15 +302,15 @@ func betterFit(candidate, current *sizeResult, target int) bool {
 
 // ── Strategy 1 ──────────────────────────────────────────────────────────────
 
-func jpegQualitySearch(src *image.NRGBA, targetBytes int) (*sizeResult, error) {
-	return jpegQualitySearchOpt(src, targetBytes, false)
+func jpegQualitySearch(ctx context.Context, src *image.NRGBA, targetBytes int) (*sizeResult, error) {
+	return jpegQualitySearchOpt(ctx, src, targetBytes, false)
 }
 
-func jpegQualitySearchFast(src *image.NRGBA, targetBytes int) (*sizeResult, error) {
-	return jpegQualitySearchOpt(src, targetBytes, true)
+func jpegQualitySearchFast(ctx context.Context, src *image.NRGBA, targetBytes int) (*sizeResult, error) {
+	return jpegQualitySearchOpt(ctx, src, targetBytes, true)
 }
 
-func jpegQualitySearchOpt(src *image.NRGBA, targetBytes int, skipSSIM bool) (*sizeResult, error) {
+func jpegQualitySearchOpt(ctx context.Context, src *image.NRGBA, targetBytes int, skipSSIM bool) (*sizeResult, error) {
 	w := src.Bounds().Dx()
 	h := src.Bounds().Dy()
 	pixels := w * h
@@ -144,6 +332,9 @@ func jpegQualitySearchOpt(src *image.NRGBA, targetBytes int, skipSSIM bool) (*si
 	bestSSIM := 0.0
 
 	for lo <= hi {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		mid := (lo + hi) / 2
 		var buf bytes.Buffer
 		if err := encodeJPEG(&buf, src, mid, false); err != nil {
@@ -177,11 +368,14 @@ func jpegQualitySearchOpt(src *image.NRGBA, targetBytes int, skipSSIM bool) (*si
 
 // ── Strategy 2 ──────────────────────────────────────────────────────────────
 
-func quantizeStrategy(src *image.NRGBA, targetBytes int) (*sizeResult, error) {
+func quantizeStrategy(ctx context.Context, src *image.NRGBA, targetBytes int) (*sizeResult, error) {
 	w := src.Bounds().Dx()
 	h := src.Bounds().Dy()
 
 	for _, maxColors := range []int{256, 128, 64, 32, 16} {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		palette := medianCut(src, maxColors)
 		indexed := applyPalette(src, palette)
 
@@ -220,7 +414,7 @@ func jpegQualityScaleSearch(ctx context.Context, src *image.NRGBA, targetBytes i
 	finalH := int(float64(origH) * bestCand.scale)
 	finalScaled := lanczosResize(src, finalW, finalH)
 
-	r, err := jpegQualitySearch(finalScaled, targetBytes)
+	r, err := jpegQualitySearch(ctx, finalScaled, targetBytes)
 	if err != nil || r == nil || r.quality < minJPEGQuality {
 		return nil, nil
 	}
@@ -250,7 +444,7 @@ func findBestScaleBinary(ctx context.Context, src *image.NRGBA, origW, origH, ta
 			loScale = midScale
 			continue
 		}
-		r, err := jpegQualitySearchFast(boxDownsample(src, newW, newH), targetBytes)
+		r, err := jpegQualitySearchFast(ctx, boxDownsample(src, newW, newH), targetBytes)
 		if err == nil && r != nil && int64(len(r.data)) <= int64(targetBytes) && r.quality >= minJPEGQuality {
 			bestCand = &scaleCandidate{scale: midScale, quality: r.quality, size: len(r.data)}
 			loScale = midScale
@@ -270,7 +464,7 @@ func findBestScaleFixed(ctx context.Context, src *image.NRGBA, origW, origH, tar
 		if newW < 8 || newH < 8 {
 			continue
 		}
-		r, err := jpegQualitySearchFast(boxDownsample(src, newW, newH), targetBytes)
+		r, err := jpegQualitySearchFast(ctx, boxDownsample(src, newW, newH), targetBytes)
 		if err == nil && r != nil && int64(len(r.data)) <= int64(targetBytes) && r.quality >= minJPEGQuality {
 			if best == nil || scale > best.scale {
 				best = &scaleCandidate{scale: scale, quality: r.quality, size: len(r.data)}
@@ -297,7 +491,7 @@ func scaleSearch(ctx context.Context, src *image.NRGBA, targetBytes int, format 
 			continue
 		}
 
-		fits, q := testScaleFits(boxDownsample(src, newW, newH), targetBytes, format)
+		fits, q := testScaleFits(ctx, boxDownsample(src, newW, newH), targetBytes, format)
 		if fits {
 			bestScale, bestQ, lo = mid, q, mid
 		} else {
@@ -309,12 +503,12 @@ func scaleSearch(ctx context.Context, src *image.NRGBA, targetBytes int, format 
 		return nil, nil
 	}
 	finalW, finalH := int(float64(origW)*bestScale), int(float64(origH)*bestScale)
-	return executeFinalScaleEncode(src, format, bestScale, bestQ, finalW, finalH, targetBytes)
+	return executeFinalScaleEncode(ctx, src, format, bestScale, bestQ, finalW, finalH, targetBytes)
 }
 
-func testScaleFits(scaled *image.NRGBA, targetBytes int, format Format) (bool, int) {
+func testScaleFits(ctx context.Context, scaled *image.NRGBA, targetBytes int, format Format) (bool, int) {
 	if format == JPEG {
-		if r, err := jpegQualitySearchFast(scaled, targetBytes); err == nil && r != nil && int64(len(r.data)) <= int64(targetBytes) && r.quality >= minJPEGQuality {
+		if r, err := jpegQualitySearchFast(ctx, scaled, targetBytes); err == nil && r != nil && int64(len(r.data)) <= int64(targetBytes) && r.quality >= minJPEGQuality {
 			return true, r.quality
 		}
 		return false, 0
@@ -327,11 +521,11 @@ func testScaleFits(scaled *image.NRGBA, targetBytes int, format Format) (bool, i
 	return false, 0
 }
 
-func executeFinalScaleEncode(src *image.NRGBA, format Format, scale float64, bestQ, finalW, finalH, targetBytes int) (*sizeResult, error) {
+func executeFinalScaleEncode(ctx context.Context, src *image.NRGBA, format Format, scale float64, bestQ, finalW, finalH, targetBytes int) (*sizeResult, error) {
 	scaled := lanczosResize(src, finalW, finalH)
 	var buf bytes.Buffer
 	if format == JPEG {
-		r, err := jpegQualitySearchFast(scaled, targetBytes)
+		r, err := jpegQualitySearchFast(ctx, scaled, targetBytes)
 		if err == nil && r != nil {
 			return &sizeResult{data: r.data, format: JPEG, quality: r.quality, ssim: computeSSIMNRGBA(src, scaled), finalW: finalW, finalH: finalH, img: scaled}, nil
 		}

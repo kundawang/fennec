@@ -116,6 +116,14 @@ func compressImageInternal(ctx context.Context, img image.Image, orient Orientat
 	result := &Result{OriginalDimensions: image.Pt(bounds.Dx(), bounds.Dy())}
 	src := toNRGBA(img)
 
+	// Validate regions against the decoded pixel grid before orientation or
+	// resizing, then remap them into display (oriented) coordinates.
+	rs, err := newRegionSet(opts.optionsRegionList(), bounds.Dx(), bounds.Dy(), orient,
+		opts.AutoOrient)
+	if err != nil {
+		return nil, err
+	}
+
 	if opts.AutoOrient && orient > OrientNormal {
 		src = ApplyOrientation(src, orient)
 		result.OriginalDimensions = image.Pt(src.Bounds().Dx(), src.Bounds().Dy())
@@ -124,24 +132,56 @@ func compressImageInternal(ctx context.Context, img image.Image, orient Orientat
 		return nil, err
 	}
 
+	preResizeW, preResizeH := src.Bounds().Dx(), src.Bounds().Dy()
 	if opts.MaxWidth > 0 || opts.MaxHeight > 0 {
 		src = smartResize(src, opts.MaxWidth, opts.MaxHeight)
 	}
 	result.Image = src
 	result.FinalDimensions = image.Pt(src.Bounds().Dx(), src.Bounds().Dy())
 
+	// Regions were validated in source space; remap their coordinate base so
+	// MaxWidth/MaxHeight resizing is accounted for.
+	if rs != nil && (preResizeW != src.Bounds().Dx() || preResizeH != src.Bounds().Dy()) {
+		rs = rs.remapBase(src.Bounds().Dx(), src.Bounds().Dy())
+	}
+
+	// Record an explicitly requested whole-image target; in target-size mode
+	// it is enforced together with region thresholds.
+	if opts.TargetSSIM > 0 {
+		result.TargetSSIM = opts.TargetSSIM
+	}
+
 	if err := opts.reportProgress(ctx, StageCompressing, 0.2); err != nil {
 		return nil, err
 	}
 
 	if opts.TargetSize > 0 {
-		return handleTargetSizeMode(ctx, src, opts, result)
+		return handleTargetSizeMode(ctx, src, rs, opts, result)
 	}
-	return handleStandardMode(ctx, src, opts, result)
+	return handleStandardMode(ctx, src, rs, opts, result)
 }
 
-func handleTargetSizeMode(ctx context.Context, src *image.NRGBA, opts Options, result *Result) (*Result, error) {
-	sr, err := hitTargetSize(ctx, src, opts.TargetSize, opts)
+// remapBase returns a copy of the region set whose base coordinate space is
+// outW x outH. It is used after MaxWidth/MaxHeight resizing so regions follow
+// the subject into the resized image.
+func (rs *regionSet) remapBase(outW, outH int) *regionSet {
+	if rs == nil || rs.baseW == outW && rs.baseH == outH {
+		return rs
+	}
+	next := &regionSet{baseW: outW, baseH: outH, targets: make([]regionTarget, len(rs.targets))}
+	for i, t := range rs.targets {
+		next.targets[i] = regionTarget{
+			request:  t.request,
+			oriented: mapRectScale(t.oriented, rs.baseW, rs.baseH, outW, outH),
+			minSSIM:  t.minSSIM,
+		}
+	}
+	next.enforce = disjointEnforcement(next.targets)
+	return next
+}
+
+func handleTargetSizeMode(ctx context.Context, src *image.NRGBA, rs *regionSet, opts Options, result *Result) (*Result, error) {
+	sr, err := hitTargetSize(ctx, src, opts.TargetSize, rs, opts)
 	if err != nil {
 		return nil, fmt.Errorf("fennec: target-size compression: %w", err)
 	}
@@ -154,12 +194,15 @@ func handleTargetSizeMode(ctx context.Context, src *image.NRGBA, opts Options, r
 	if sr.img != nil {
 		result.Image = sr.img
 	}
+	result.RegionResults = sr.regions
+	result.Regions = sr.regions
+	result.RegionSSIM = regionSSIMs(sr.regions)
 	result.CompressedSize = int64(len(sr.data))
 	result.computeStats()
 	return result, nil
 }
 
-func handleStandardMode(ctx context.Context, src *image.NRGBA, opts Options, result *Result) (*Result, error) {
+func handleStandardMode(ctx context.Context, src *image.NRGBA, rs *regionSet, opts Options, result *Result) (*Result, error) {
 	if opts.Format == Auto {
 		opts.Format = analyzeFormat(src)
 	}
@@ -176,17 +219,34 @@ func handleStandardMode(ctx context.Context, src *image.NRGBA, opts Options, res
 			return nil, fmt.Errorf("fennec: PNG compression: %w", err)
 		}
 		result.SSIM = 1.0
+		if rs.len() > 0 {
+			// PNG is lossless; still report measured per-region quality so
+			// callers get the same shape of result as with JPEG.
+			_, regions, _ := evaluateRegions(ctx, rs, 0, src, src)
+			result.RegionResults = regions
+			result.Regions = regions
+			result.RegionSSIM = regionSSIMs(regions)
+		}
 	case JPEG:
 		target := opts.Quality.targetSSIM()
 		if opts.TargetSSIM > 0 && opts.TargetSSIM <= 1.0 {
 			target = opts.TargetSSIM
 		}
 
-		q, ssim, cachedData, err := compressJPEGOptimal(src, &compressed, target, opts)
+		// Only attach a gate when regions are configured. Without regions the
+		// search behaves exactly as before, with the target SSIM alone.
+		var gate *qualityGate
+		if rs.len() > 0 {
+			gate = newQualityGate(ctx, rs, target, src)
+		}
+		q, ssim, regions, cachedData, err := compressJPEGOptimal(ctx, src, &compressed, target, gate, opts)
 		if err != nil {
 			return nil, fmt.Errorf("fennec: JPEG compression: %w", err)
 		}
 		result.JPEGQuality, result.SSIM = q, ssim
+		result.RegionResults = regions
+		result.Regions = regions
+		result.RegionSSIM = regionSSIMs(regions)
 		if cachedData != nil {
 			compressed.Reset()
 			compressed.Write(cachedData)

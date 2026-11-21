@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"image"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -54,6 +56,7 @@ type appConfig struct {
 	quality, format, targetSize string
 	maxWidth, maxHeight         int
 	ssimTarget                  float64
+	regions                     regionFlags
 	noOrient, analyze, verbose  bool
 	input, output               string
 }
@@ -75,6 +78,8 @@ func parseFlags() appConfig {
 	flag.IntVar(&cfg.maxHeight, "max-height", 0, "Max height")
 	flag.StringVar(&cfg.targetSize, "target-size", "", "Target file size")
 	flag.Float64Var(&cfg.ssimTarget, "ssim", 0, "Custom SSIM target")
+	flag.Var(&cfg.regions, "region",
+		"Region to protect: x,y,w,h,ssim (repeatable; coordinates in source pixels)")
 	flag.BoolVar(&cfg.noOrient, "no-orient", false, "Don't auto-rotate")
 	flag.BoolVar(&cfg.analyze, "analyze", false, "Analyze image")
 	flag.BoolVar(&cfg.verbose, "v", false, "Verbose output")
@@ -126,6 +131,13 @@ func runCompression(cfg appConfig) {
 	} else {
 		fmt.Printf("%s -> %s | %s | SSIM: %.4f | Saved: %.1f%% | %v\n", cfg.input, cfg.output, result.Format, result.SSIM, result.SavingsPercent, elapsed)
 	}
+	for i, rr := range result.RegionResults {
+		status := "ok"
+		if !rr.Meets {
+			status = "MISSED"
+		}
+		fmt.Printf("  region %d %v: SSIM %.4f (min %.4f) %s\n", i, rr.SourceRect, rr.SSIM, rr.MinSSIM, status)
+	}
 }
 
 func buildOptions(cfg appConfig) fennec.Options {
@@ -146,6 +158,9 @@ func buildOptions(cfg appConfig) fennec.Options {
 			os.Exit(1)
 		}
 		opts.TargetSize = ts
+	}
+	if len(cfg.regions) > 0 {
+		opts.Regions = cfg.regions.toRegions()
 	}
 	opts.Quality, opts.Format = parseQuality(cfg.quality), parseFormat(cfg.format)
 	if cfg.verbose {
@@ -183,4 +198,51 @@ func parseFormat(f string) fennec.Format {
 	default:
 		return fennec.Auto
 	}
+}
+
+// regionFlags implements flag.Value for repeatable -region flags.
+type regionFlags []regionSpec
+
+type regionSpec struct {
+	rect    image.Rectangle
+	minSSIM float64
+}
+
+func (r *regionFlags) String() string { return "" }
+
+func (r *regionFlags) Set(v string) error {
+	parts := strings.Split(v, ",")
+	if len(parts) != 5 {
+		return fmt.Errorf("region %q: expected x,y,w,h,ssim", v)
+	}
+	var vals [5]float64
+	for i, p := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil {
+			return fmt.Errorf("region %q: %w", v, err)
+		}
+		vals[i] = f
+	}
+	x, y, w, h := int(vals[0]), int(vals[1]), int(vals[2]), int(vals[3])
+	if w <= 0 || h <= 0 {
+		return fmt.Errorf("region %q: width and height must be positive", v)
+	}
+	var minSSIM float64
+	if vals[4] < 0 || vals[4] > 1 || math.IsNaN(vals[4]) {
+		return fmt.Errorf("region %q: SSIM must be in [0,1]", v)
+	}
+	minSSIM = vals[4]
+	*r = append(*r, regionSpec{
+		rect:    image.Rect(x, y, x+w, y+h),
+		minSSIM: minSSIM,
+	})
+	return nil
+}
+
+func (r regionFlags) toRegions() []fennec.Region {
+	out := make([]fennec.Region, 0, len(r))
+	for _, rf := range r {
+		out = append(out, fennec.Region{Rect: rf.rect, MinSSIM: rf.minSSIM})
+	}
+	return out
 }

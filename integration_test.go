@@ -2,6 +2,7 @@ package fennec
 
 import (
 	"context"
+	"image"
 	"os"
 	"path/filepath"
 	"testing"
@@ -221,5 +222,36 @@ func TestIntegrationBatchCompress(t *testing.T) {
 			}
 		}
 		t.Fatalf("expected 2 succeeded, got %d (failed: %d)", summary.Succeeded, summary.Failed)
+	}
+}
+
+func TestIntegrationRegionConstraints(t *testing.T) {
+	ensureTestdata(t)
+	tmpDir := t.TempDir()
+	dst := filepath.Join(tmpDir, "regions.jpg")
+
+	opts := DefaultOptions()
+	opts.Format = JPEG
+	opts.TargetSSIM = 0.85
+	opts.Regions = []Region{
+		{Rect: image.Rect(100, 75, 300, 225), MinSSIM: 0.90},
+	}
+
+	result, err := CompressFile(context.Background(), "testdata/gradient.jpg", dst, opts)
+	if err != nil {
+		t.Fatalf("CompressFile region: %v", err)
+	}
+	if len(result.RegionResults) != 1 {
+		t.Fatalf("expected 1 region result, got %d", len(result.RegionResults))
+	}
+	if result.RegionResults[0].SSIM < 0.90 {
+		t.Fatalf("region SSIM %.4f < 0.90", result.RegionResults[0].SSIM)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != result.CompressedSize {
+		t.Fatalf("file size %d != reported %d", info.Size(), result.CompressedSize)
 	}
 }

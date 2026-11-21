@@ -169,6 +169,60 @@ The zero value of `Options{}` uses `Balanced` — you get great results without 
 
 ---
 
+## Region Quality Constraints
+
+Protect the parts of an image that matter — eyes, faces, product labels, text — while
+letting the rest of the frame compress harder. Each region has its own minimum SSIM, and can be
+combined with a `TargetSize` budget.
+
+```go
+opts := fennec.DefaultOptions()
+opts.TargetSize = 120 * 1024 // whole file ≤ 120 KB
+opts.Regions = []fennec.Region{
+	{Rect: image.Rect(1240, 380, 1560, 620), MinSSIM: 0.97}, // eyes
+	{Rect: image.Rect(980, 1650, 1880, 1790), MinSSIM: 0.95}, // title text
+}
+result, err := fennec.CompressFile(ctx, "poster.png", "poster.jpg", opts)
+
+for i, r := range result.RegionResults {
+	fmt.Printf("region %d: %dx%d → SSIM %.4f (min %.4f)\n",
+		i, r.Rect.Dx(), r.Rect.Dy(), r.SSIM, r.MinSSIM)
+}
+fmt.Println(result.CompressedSize, result.SSIM) // actual bytes + whole-image SSIM
+```
+
+Behavior:
+
+* **Coordinates** are in the decoded source image's pixel grid. With `AutoOrient` (the default)
+  Fennec maps them through the EXIF rotation/flip, then through `MaxWidth`/`MaxHeight` and
+  target-size downscaling, so a rectangle keeps tracking its subject.
+* **Overlapping regions** are each measured; both thresholds apply, so the stricter one governs
+  the shared pixels.
+* **Clamping**: rectangles partially outside the image are clamped. Empty rectangles return
+  `ErrInvalidRegion`; rectangles entirely outside return `ErrRegionOutOfBounds`.
+* **Transparent regions** (every pixel alpha = 0) are reported with `Transparent: true` and
+  skip the threshold.
+* **Unreachable goals** — a region threshold no encoding can meet, or a `TargetSize` that
+  cannot coexist with the quality thresholds — return a `*QualityError` wrapping
+  `ErrQualityTargetUnreachable` (alias `ErrImpossibleTargets`). It reports the best SSIM,
+  quality, and per-region measurements actually achieved.
+* **No regions configured** leaves output byte-for-byte unchanged.
+* Cancellation is honored across every search strategy and measurement.
+
+The same constraints apply through `Encode(w, img, format, opts)` and the CLI:
+
+```bash
+fennec -target-size 120KB \
+  -region 1240,380,320,240,0.97 \
+  -region 980,1650,900,140,0.95 \
+  poster.png poster.jpg
+```
+
+`-region x,y,width,height,minSSIM` is repeatable, and each configured region is printed with its
+measured SSIM and target after compression.
+
+---
+
 ## CLI
 
 ```
@@ -181,6 +235,7 @@ Flags:
   -max-height int     Maximum height (0 = no limit)
   -target-size string Target file size (e.g. 100KB, 2MB)
   -ssim float         Custom SSIM target (0.0-1.0, overrides quality)
+  -region string      Protect a region: x,y,w,h,ssim (repeatable)
   -no-orient          Don't auto-rotate based on EXIF orientation
   -analyze            Analyze image without compressing
 ```
@@ -238,6 +293,7 @@ When you specify a `TargetSize`, Fennec tries four strategies and picks the best
 | `Compress(ctx, reader, opts)`          | `io.Reader` → `Result`             |
 | `CompressBytes(ctx, data, opts)`       | `[]byte` → `Result`                |
 | `CompressBatch(ctx, items, batchOpts)` | Concurrent batch compression       |
+| `Options.Regions` / `Region`           | Per-region minimum SSIM constraints |
 | `Analyze(img)`                         | Image analysis without compression |
 
 ### SSIM Functions
@@ -280,6 +336,8 @@ Ratio          float64
 SavingsPercent float64
 OriginalDimensions  image.Point
 FinalDimensions     image.Point
+RegionResults  []RegionResult // per-region measured quality (nil if unconfigured)
+RegionSSIM     []float64      // per-region SSIM in input order
 }
 
 // Write compressed bytes to any writer (http.ResponseWriter, file, S3, etc.)

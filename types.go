@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"math"
 )
 
 // Version is the library version.
@@ -164,6 +165,23 @@ type Options struct {
 	// Default: true. Set to false to preserve original pixel orientation.
 	AutoOrient bool
 
+	// Regions constrains the minimum perceptual quality of one or more
+	// rectangular areas (for example eyes, faces, or text) while the rest of
+	// the image may be compressed more aggressively. Coordinates are in the
+	// decoded source image's pixel grid; with AutoOrient enabled they are
+	// mapped through the EXIF rotation/flip, then through MaxWidth/MaxHeight
+	// and target-size scaling. Empty means no region constraints, preserving
+	// the previous output exactly.
+	Regions []Region
+
+	// QualityRegions is an alias for Regions; both slices are merged. Prefer
+	// Regions for new code.
+	QualityRegions []Region
+
+	// RegionConstraints is an alias for Regions; all configured slices are
+	// merged. Prefer Regions for new code.
+	RegionConstraints []Region
+
 	// OnProgress is called during compression to report progress.
 	// Optional. Returning a non-nil error aborts the operation.
 	OnProgress ProgressFunc
@@ -197,6 +215,16 @@ func (o *Options) Validate() error {
 	}
 	if o.Format < Auto || o.Format > PNG {
 		return fmt.Errorf("fennec: invalid Format %d", o.Format)
+	}
+	for i, r := range o.optionsRegionList() {
+		if r.rect().Canon().Empty() {
+			return fmt.Errorf("%w: regions[%d] has an empty rectangle", ErrInvalidRegion, i)
+		}
+		if math.IsNaN(r.MinSSIM) || math.IsInf(r.MinSSIM, 0) ||
+			r.MinSSIM < 0 || r.MinSSIM > 1 {
+			return fmt.Errorf("%w: regions[%d] MinSSIM must be in [0.0, 1.0], got %f",
+				ErrInvalidRegion, i, r.MinSSIM)
+		}
 	}
 	return nil
 }
@@ -238,6 +266,10 @@ type Result struct {
 	// SSIM is the structural similarity between original and compressed.
 	SSIM float64
 
+	// TargetSSIM is the full-image SSIM target in force (0 when none was
+	// requested). It is reported so callers can audit quality goals.
+	TargetSSIM float64
+
 	// JPEGQuality is the JPEG quality used (0 if PNG).
 	JPEGQuality int
 
@@ -252,6 +284,18 @@ type Result struct {
 
 	// FinalDimensions is the output width x height.
 	FinalDimensions image.Point
+
+	// RegionResults reports measured quality for each configured Region.
+	// Nil when no regions were requested.
+	RegionResults []RegionResult
+
+	// Regions is an alias of RegionResults.
+	Regions []RegionResult
+
+	// RegionSSIM holds the measured SSIM for each configured region, in the
+	// same order the regions were supplied. Nil when no regions were
+	// requested.
+	RegionSSIM []float64
 }
 
 // WriteTo writes the compressed image data to w.
@@ -278,7 +322,7 @@ func (r *Result) String() string {
 	if r.Format == JPEG && r.JPEGQuality > 0 {
 		qStr = fmt.Sprintf(" Q=%d |", r.JPEGQuality)
 	}
-	return fmt.Sprintf(
+	base := fmt.Sprintf(
 		"Fennec Result: %s |%s %dx%d → %dx%d | %s → %s | SSIM: %.4f | Saved: %.1f%%",
 		format, qStr,
 		r.OriginalDimensions.X, r.OriginalDimensions.Y,
@@ -286,6 +330,21 @@ func (r *Result) String() string {
 		humanBytes(r.OriginalSize), humanBytes(r.CompressedSize),
 		r.SSIM, r.SavingsPercent,
 	)
+	regions := r.RegionResults
+	if len(regions) == 0 {
+		regions = r.Regions
+	}
+	if len(regions) == 0 {
+		return base
+	}
+	var regionStr string
+	for i, rr := range regions {
+		if i > 0 {
+			regionStr += ";"
+		}
+		regionStr += fmt.Sprintf(" [%d] %.4f/%.4f", i, rr.SSIM, rr.MinSSIM)
+	}
+	return base + " | Regions (SSIM/target):" + regionStr
 }
 
 // computeStats fills in the computed fields (Ratio, SavingsPercent) from sizes.

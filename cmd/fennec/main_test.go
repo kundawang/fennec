@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -304,5 +305,74 @@ func TestParseSize(t *testing.T) {
 				t.Fatalf("parseSize(%q) = %d, want %d", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCLIRegionFlag(t *testing.T) {
+	binary := buildBinary(t)
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "input.jpg")
+	dst := filepath.Join(tmpDir, "output.jpg")
+	createTestJPEG(t, src)
+
+	cmd := exec.Command(binary, "-region", "100,100,80,80,0.5", "-region", "0,0,20,20,0.4", src, dst)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CLI region failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(dst); os.IsNotExist(err) {
+		t.Fatal("Output not created")
+	}
+	if !strings.Contains(string(out), "region 0") {
+		t.Fatalf("expected region report in output, got:\n%s", out)
+	}
+}
+
+func TestCLIRegionFlagInvalid(t *testing.T) {
+	binary := buildBinary(t)
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "input.jpg")
+	createTestJPEG(t, src)
+
+	cases := [][]string{
+		{"-region", "1,2,3", src},
+		{"-region", "a,b,c,d,e", src},
+		{"-region", "0,0,0,10,0.9", src},
+	}
+	for _, args := range cases {
+		cmd := exec.Command(binary, args...)
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("expected failure for %v", args)
+		}
+	}
+}
+
+func TestParseRegionFlag(t *testing.T) {
+	var rf regionFlags
+	if err := rf.Set("10,20,30,40,0.95"); err != nil {
+		t.Fatal(err)
+	}
+	regions := rf.toRegions()
+	if len(regions) != 1 {
+		t.Fatalf("expected 1 region, got %d", len(regions))
+	}
+	want := image.Rect(10, 20, 40, 60)
+	if regions[0].Rect != want {
+		t.Fatalf("rect = %v, want %v", regions[0].Rect, want)
+	}
+	if regions[0].MinSSIM != 0.95 {
+		t.Fatalf("MinSSIM = %v", regions[0].MinSSIM)
+	}
+}
+
+func TestCLIRegionFlagOutOfRangeSSIM(t *testing.T) {
+	binary := buildBinary(t)
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "input.jpg")
+	createTestJPEG(t, src)
+
+	cmd := exec.Command(binary, "-region", "0,0,10,10,1.5", src)
+	if err := cmd.Run(); err == nil {
+		t.Fatal("expected failure for out-of-range SSIM")
 	}
 }

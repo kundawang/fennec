@@ -1,6 +1,7 @@
 package fennec
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -110,6 +111,8 @@ func Save(img image.Image, filename string, opts Options) error {
 }
 
 // Encode writes the image to w in the specified format with Fennec optimization.
+// When opts.Regions is set, JPEG encoding honors the region thresholds; a
+// returned error wraps ErrQualityTargetUnreachable if they cannot be met.
 func Encode(w io.Writer, img image.Image, format Format, opts Options) error {
 	src := toNRGBARef(img)
 
@@ -119,7 +122,16 @@ func Encode(w io.Writer, img image.Image, format Format, opts Options) error {
 		if opts.TargetSSIM > 0 {
 			targetSSIM = opts.TargetSSIM
 		}
-		_, _, _, err := compressJPEGOptimal(src, w, targetSSIM, opts)
+		bounds := src.Bounds()
+		rs, err := newRegionSet(opts.optionsRegionList(), bounds.Dx(), bounds.Dy(), OrientNormal, false)
+		if err != nil {
+			return err
+		}
+		var gate *qualityGate
+		if rs.len() > 0 {
+			gate = newQualityGate(context.Background(), rs, targetSSIM, src)
+		}
+		_, _, _, _, err = compressJPEGOptimal(context.Background(), src, w, targetSSIM, gate, opts)
 		return err
 	case PNG:
 		return compressPNG(src, w, opts)
